@@ -19,7 +19,7 @@ import (
 const (
 	ssdpMulticast = "239.255.255.250:1900"
 	deviceUUID    = "uuid:11111111-2222-3333-4444-555555555555"
-	deviceName    = "mpv-renderer"
+	deviceName    = "auror"
 )
 
 var (
