@@ -1,8 +1,10 @@
 package main
 
 import (
-	"bytes"
+	"bufio"
+	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"net"
@@ -10,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -20,15 +23,108 @@ const (
 	ssdpMulticast = "239.255.255.250:1900"
 	deviceUUID    = "uuid:11111111-2222-3333-4444-555555555555"
 	deviceName    = "auror"
+	mpvSocket     = "/tmp/auror-mpv.sock"
 )
 
 var (
-	httpPort   = "49152"
-	localIP    string
-	mpvCmd     *exec.Cmd
-	mpvMu      sync.Mutex
-	currentURL string
+	httpPort     = "49152"
+	localIP      string
+	mpvCmd       *exec.Cmd
+	mpvMu        sync.Mutex
+	currentURL   string
+	currentSub   string
+	pendingStart string
+	playingURL   string
 )
+
+func mpvCommand(args ...any) (map[string]any, error) {
+	conn, err := net.DialTimeout("unix", mpvSocket, 500*time.Millisecond)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(1 * time.Second))
+
+	payload, err := json.Marshal(map[string]any{"command": args})
+	if err != nil {
+		return nil, err
+	}
+	if _, err := conn.Write(append(payload, '\n')); err != nil {
+		return nil, err
+	}
+	scanner := bufio.NewScanner(conn)
+	scanner.Buffer(make([]byte, 0, 4096), 1<<20)
+	for scanner.Scan() {
+		var resp map[string]any
+		if err := json.Unmarshal(scanner.Bytes(), &resp); err != nil {
+			continue
+		}
+		if _, hasEvent := resp["event"]; hasEvent {
+			continue
+		}
+		return resp, nil
+	}
+	return nil, scanner.Err()
+}
+
+func mpvGet(prop string) (any, bool) {
+	resp, err := mpvCommand("get_property", prop)
+	if err != nil {
+		return nil, false
+	}
+	if resp["error"] != "success" {
+		return nil, false
+	}
+	return resp["data"], true
+}
+
+func mpvRunning() bool {
+	mpvMu.Lock()
+	defer mpvMu.Unlock()
+	return mpvCmd != nil && mpvCmd.Process != nil
+}
+
+func formatHMS(seconds float64) string {
+	if seconds < 0 || seconds != seconds {
+		return "00:00:00"
+	}
+	s := int(seconds)
+	return fmt.Sprintf("%02d:%02d:%02d", s/3600, (s/60)%60, s%60)
+}
+
+func parseHMS(s string) (float64, error) {
+	s = strings.TrimSpace(s)
+	parts := strings.Split(s, ":")
+	var h, m int
+	var sec float64
+	var err error
+	switch len(parts) {
+	case 3:
+		if h, err = strconv.Atoi(parts[0]); err != nil {
+			return 0, err
+		}
+		if m, err = strconv.Atoi(parts[1]); err != nil {
+			return 0, err
+		}
+		if sec, err = strconv.ParseFloat(parts[2], 64); err != nil {
+			return 0, err
+		}
+	case 2:
+		if m, err = strconv.Atoi(parts[0]); err != nil {
+			return 0, err
+		}
+		if sec, err = strconv.ParseFloat(parts[1], 64); err != nil {
+			return 0, err
+		}
+	case 1:
+		if sec, err = strconv.ParseFloat(parts[0], 64); err != nil {
+			return 0, err
+		}
+	default:
+		return 0, fmt.Errorf("bad time %q", s)
+	}
+	return float64(h*3600+m*60) + sec, nil
+}
 
 func getLocalIP() string {
 	conn, err := net.Dial("udp4", "239.255.255.250:1900")
@@ -104,6 +200,13 @@ func avtSCPDXML() string {
         <argument><name>InstanceID</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_InstanceID</relatedStateVariable></argument>
       </argumentList>
     </action>
+    <action><name>Seek</name>
+      <argumentList>
+        <argument><name>InstanceID</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_InstanceID</relatedStateVariable></argument>
+        <argument><name>Unit</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_SeekMode</relatedStateVariable></argument>
+        <argument><name>Target</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_SeekTarget</relatedStateVariable></argument>
+      </argumentList>
+    </action>
     <action><name>GetTransportInfo</name>
       <argumentList>
         <argument><name>InstanceID</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_InstanceID</relatedStateVariable></argument>
@@ -162,6 +265,8 @@ func avtSCPDXML() string {
     <stateVariable><name>RecordStorageMedium</name><dataType>string</dataType></stateVariable>
     <stateVariable><name>RecordMediumWriteStatus</name><dataType>string</dataType></stateVariable>
     <stateVariable><name>A_ARG_TYPE_InstanceID</name><dataType>ui4</dataType></stateVariable>
+    <stateVariable><name>A_ARG_TYPE_SeekMode</name><dataType>string</dataType><allowedValueList><allowedValue>REL_TIME</allowedValue><allowedValue>ABS_TIME</allowedValue></allowedValueList></stateVariable>
+    <stateVariable><name>A_ARG_TYPE_SeekTarget</name><dataType>string</dataType></stateVariable>
   </serviceStateTable>
 </scpd>`
 }
@@ -219,36 +324,75 @@ func extractTag(body, tag string) string {
 	return body[s : s+e]
 }
 
-func playURL(url string) {
+func playURL(url, subURL string) {
 	mpvMu.Lock()
-	defer mpvMu.Unlock()
-
-	if mpvCmd != nil && mpvCmd.Process != nil {
-		mpvCmd.Process.Kill()
-		mpvCmd.Wait()
-		mpvCmd = nil
-	}
 
 	if url == "" {
+		mpvMu.Unlock()
 		return
 	}
 
+	if mpvCmd != nil && mpvCmd.Process != nil && playingURL == url {
+		start := pendingStart
+		pendingStart = ""
+		mpvMu.Unlock()
+		if start != "" {
+			if secs, err := parseHMS(start); err == nil {
+				if resp, err := mpvCommand("seek", secs, "absolute"); err != nil {
+					log.Printf("resume seek failed: %v", err)
+				} else {
+					log.Printf("resume seek → %s: %v", start, resp["error"])
+				}
+			}
+		}
+		if resp, err := mpvCommand("set_property", "pause", false); err != nil {
+			log.Printf("unpause failed: %v", err)
+		} else {
+			log.Printf("unpause: %v", resp["error"])
+		}
+		return
+	}
+
+	if mpvCmd != nil && mpvCmd.Process != nil {
+		mpvCmd.Process.Kill()
+		mpvCmd = nil
+	}
+
+	os.Remove(mpvSocket)
+
 	currentURL = url
+	playingURL = url
 	fmt.Printf("\n▶ playing: %s\n", url)
-	cmd := exec.Command("mpv", url)
+	if subURL != "" {
+		fmt.Printf("   sub    : %s\n", subURL)
+	}
+	args := []string{url, "--input-ipc-server=" + mpvSocket}
+	if subURL != "" {
+		args = append(args, "--sub-file="+subURL)
+	}
+	if pendingStart != "" {
+		args = append(args, "--start="+pendingStart)
+		fmt.Printf("   start  : %s\n", pendingStart)
+		pendingStart = ""
+	}
+	cmd := exec.Command("mpv", args...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
 		log.Println("mpv error:", err)
+		playingURL = ""
+		mpvMu.Unlock()
 		return
 	}
 	mpvCmd = cmd
+	mpvMu.Unlock()
 	go func() {
 		cmd.Wait()
 		mpvMu.Lock()
 		if mpvCmd == cmd {
 			mpvCmd = nil
+			playingURL = ""
 		}
 		mpvMu.Unlock()
 	}()
@@ -259,79 +403,225 @@ func stopPlayback() {
 	defer mpvMu.Unlock()
 	if mpvCmd != nil && mpvCmd.Process != nil {
 		mpvCmd.Process.Kill()
-		mpvCmd.Wait()
 		mpvCmd = nil
 	}
 	currentURL = ""
+	currentSub = ""
+	pendingStart = ""
+	playingURL = ""
+}
+
+func extractSubtitleURL(metadata string, headers http.Header) string {
+	if h := headers.Get("CaptionInfo.sec"); h != "" {
+		return h
+	}
+	if metadata == "" {
+		return ""
+	}
+	meta := html.UnescapeString(metadata)
+	if strings.Contains(meta, "&lt;") || strings.Contains(meta, "&amp;") {
+		meta = html.UnescapeString(meta)
+	}
+	for _, tag := range []string{"sec:CaptionInfoEx", "sec:CaptionInfo", "pv:subtitleFileUri"} {
+		if u := strings.TrimSpace(extractTag(meta, tag)); u != "" {
+			return u
+		}
+	}
+	lower := strings.ToLower(meta)
+	subMimes := []string{"text/srt", "text/vtt", "application/x-subrip", "smi/caption", "text/sub", "application/ttml", "text/x-ssa"}
+	idx := 0
+	for {
+		i := strings.Index(lower[idx:], "<res ")
+		if i == -1 {
+			break
+		}
+		i += idx
+		j := strings.Index(lower[i:], "</res>")
+		if j == -1 {
+			break
+		}
+		j += i
+		seg := meta[i:j]
+		segLower := lower[i:j]
+		for _, m := range subMimes {
+			if strings.Contains(segLower, m) {
+				if gt := strings.Index(seg, ">"); gt != -1 {
+					return strings.TrimSpace(seg[gt+1:])
+				}
+			}
+		}
+		idx = j + len("</res>")
+	}
+	return ""
 }
 
 func handleControl(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, "bad request", 400)
+		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
 
-	soapAction := r.Header.Get("SOAPAction")
-	soapAction = strings.Trim(soapAction, `"`)
+	soapAction := strings.Trim(r.Header.Get("SOAPAction"), `"`)
 	bodyStr := string(body)
+
+	var xmlns, actionName string
+	if parts := strings.SplitN(soapAction, "#", 2); len(parts) == 2 {
+		xmlns, actionName = parts[0], parts[1]
+	}
 
 	log.Printf("SOAP action: %s", soapAction)
 
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
 
-	switch {
-	case strings.Contains(soapAction, "SetAVTransportURI"):
-		uri := extractTag(bodyStr, "CurrentURI")
-		uri = strings.ReplaceAll(uri, "&amp;", "&")
-		uri = strings.ReplaceAll(uri, "&lt;", "<")
-		uri = strings.ReplaceAll(uri, "&gt;", ">")
+	switch actionName {
+	case "SetAVTransportURI":
+		uri := html.UnescapeString(extractTag(bodyStr, "CurrentURI"))
+		meta := extractTag(bodyStr, "CurrentURIMetaData")
+		sub := extractSubtitleURL(meta, r.Header)
+		mpvMu.Lock()
 		currentURL = uri
-		log.Printf("SetAVTransportURI: %s", uri)
-		fmt.Fprintf(w, soapOK(soapAction))
+		currentSub = sub
+		mpvMu.Unlock()
+		log.Printf("SetAVTransportURI: %s (sub=%s)", uri, sub)
+		io.WriteString(w, soapOK(soapAction))
 
-	case strings.Contains(soapAction, "Play"):
-		log.Printf("Play: %s", currentURL)
-		go playURL(currentURL)
-		fmt.Fprintf(w, soapOK(soapAction))
+	case "Play":
+		mpvMu.Lock()
+		url, sub := currentURL, currentSub
+		mpvMu.Unlock()
+		log.Printf("Play: %s (sub=%s)", url, sub)
+		go playURL(url, sub)
+		io.WriteString(w, soapOK(soapAction))
 
-	case strings.Contains(soapAction, "Stop"):
+	case "Stop":
 		log.Println("Stop")
 		go stopPlayback()
-		fmt.Fprintf(w, soapOK(soapAction))
+		io.WriteString(w, soapOK(soapAction))
 
-	case strings.Contains(soapAction, "Pause"):
-		log.Println("Pause (not supported, sending OK)")
-		fmt.Fprintf(w, soapOK(soapAction))
-
-	case strings.Contains(soapAction, "GetTransportInfo"):
-		state := "STOPPED"
-		mpvMu.Lock()
-		if mpvCmd != nil && mpvCmd.Process != nil {
-			state = "PLAYING"
+	case "Pause":
+		log.Println("Pause")
+		if _, err := mpvCommand("set_property", "pause", true); err != nil {
+			log.Printf("mpv pause failed: %v", err)
 		}
+		io.WriteString(w, soapOK(soapAction))
+
+	case "Seek":
+		unit := extractTag(bodyStr, "Unit")
+		target := extractTag(bodyStr, "Target")
+		log.Printf("Seek: unit=%s target=%s", unit, target)
+		if unit == "REL_TIME" || unit == "ABS_TIME" {
+			if secs, err := parseHMS(target); err == nil {
+				if mpvRunning() {
+					if resp, err := mpvCommand("seek", secs, "absolute"); err != nil {
+						log.Printf("mpv seek ipc error: %v — queuing as pending start", err)
+						mpvMu.Lock()
+						pendingStart = target
+						mpvMu.Unlock()
+					} else {
+						log.Printf("mpv seek → %s (%.1fs): %v", target, secs, resp["error"])
+						mpvMu.Lock()
+						pendingStart = target
+						mpvMu.Unlock()
+					}
+				} else {
+					mpvMu.Lock()
+					pendingStart = target
+					mpvMu.Unlock()
+				}
+			} else {
+				log.Printf("seek parse error: %v", err)
+			}
+		}
+		io.WriteString(w, soapOK(soapAction))
+
+	case "GetTransportInfo":
+		state := "STOPPED"
+		if mpvRunning() {
+			state = "PLAYING"
+			if v, ok := mpvGet("pause"); ok {
+				if paused, _ := v.(bool); paused {
+					state = "PAUSED_PLAYBACK"
+				}
+			}
+		}
+		respBody := fmt.Sprintf(`<CurrentTransportState>%s</CurrentTransportState><CurrentTransportStatus>OK</CurrentTransportStatus><CurrentSpeed>1</CurrentSpeed>`, state)
+		io.WriteString(w, soapResponse("u", "GetTransportInfoResponse", xmlns, respBody))
+
+	case "GetPositionInfo":
+		pos, dur := "00:00:00", "00:00:00"
+		if mpvRunning() {
+			if v, ok := mpvGet("time-pos"); ok {
+				if f, ok := v.(float64); ok {
+					pos = formatHMS(f)
+				}
+			}
+			if v, ok := mpvGet("duration"); ok {
+				if f, ok := v.(float64); ok {
+					dur = formatHMS(f)
+				}
+			}
+		}
+		mpvMu.Lock()
+		trackURI := currentURL
 		mpvMu.Unlock()
-		body := fmt.Sprintf(`<CurrentTransportState>%s</CurrentTransportState><CurrentTransportStatus>OK</CurrentTransportStatus><CurrentSpeed>1</CurrentSpeed>`, state)
-		parts := strings.SplitN(soapAction, "#", 2)
-		xmlns := parts[0]
-		fmt.Fprintf(w, soapResponse("u", "GetTransportInfoResponse", xmlns, body))
+		respBody := fmt.Sprintf(`<Track>1</Track><TrackDuration>%s</TrackDuration><TrackMetaData></TrackMetaData><TrackURI>%s</TrackURI><RelTime>%s</RelTime><AbsTime>%s</AbsTime><RelCount>0</RelCount><AbsCount>0</AbsCount>`, dur, html.EscapeString(trackURI), pos, pos)
+		io.WriteString(w, soapResponse("u", "GetPositionInfoResponse", xmlns, respBody))
 
-	case strings.Contains(soapAction, "GetPositionInfo"):
-		body := `<Track>1</Track><TrackDuration>00:00:00</TrackDuration><TrackMetaData></TrackMetaData><TrackURI></TrackURI><RelTime>00:00:00</RelTime><AbsTime>00:00:00</AbsTime><RelCount>0</RelCount><AbsCount>0</AbsCount>`
-		parts := strings.SplitN(soapAction, "#", 2)
-		xmlns := parts[0]
-		fmt.Fprintf(w, soapResponse("u", "GetPositionInfoResponse", xmlns, body))
-
-	case strings.Contains(soapAction, "GetMediaInfo"):
-		body := `<NrTracks>1</NrTracks><MediaDuration>00:00:00</MediaDuration><CurrentURI></CurrentURI><CurrentURIMetaData></CurrentURIMetaData><NextURI></NextURI><NextURIMetaData></NextURIMetaData><PlayMedium>NONE</PlayMedium><RecordMedium>NOT_IMPLEMENTED</RecordMedium><WriteStatus>NOT_IMPLEMENTED</WriteStatus>`
-		parts := strings.SplitN(soapAction, "#", 2)
-		xmlns := parts[0]
-		fmt.Fprintf(w, soapResponse("u", "GetMediaInfoResponse", xmlns, body))
+	case "GetMediaInfo":
+		dur := "00:00:00"
+		if mpvRunning() {
+			if v, ok := mpvGet("duration"); ok {
+				if f, ok := v.(float64); ok {
+					dur = formatHMS(f)
+				}
+			}
+		}
+		mpvMu.Lock()
+		cur := currentURL
+		mpvMu.Unlock()
+		respBody := fmt.Sprintf(`<NrTracks>1</NrTracks><MediaDuration>%s</MediaDuration><CurrentURI>%s</CurrentURI><CurrentURIMetaData></CurrentURIMetaData><NextURI></NextURI><NextURIMetaData></NextURIMetaData><PlayMedium>NONE</PlayMedium><RecordMedium>NOT_IMPLEMENTED</RecordMedium><WriteStatus>NOT_IMPLEMENTED</WriteStatus>`, dur, html.EscapeString(cur))
+		io.WriteString(w, soapResponse("u", "GetMediaInfoResponse", xmlns, respBody))
 
 	default:
-		log.Printf("unhandled SOAP action: %s", soapAction)
-		fmt.Fprintf(w, soapOK(soapAction))
+		log.Printf("unhandled SOAP action: %s\nheaders: %v\nbody: %s", soapAction, r.Header, bodyStr)
+		io.WriteString(w, soapOK(soapAction))
 	}
+}
+
+func handleSubAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodPut {
+		http.Error(w, "POST or PUT", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad form", http.StatusBadRequest)
+		return
+	}
+	url := strings.TrimSpace(r.FormValue("url"))
+	if url == "" {
+		body, _ := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<16))
+		url = strings.TrimSpace(string(body))
+	}
+	if url == "" {
+		http.Error(w, "missing url", http.StatusBadRequest)
+		return
+	}
+	mpvMu.Lock()
+	currentSub = url
+	mpvMu.Unlock()
+	if mpvRunning() {
+		if _, err := mpvCommand("sub-add", url, "select"); err != nil {
+			log.Printf("sub-add failed: %v", err)
+			http.Error(w, "sub-add failed: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		log.Printf("sub-add: %s", url)
+	} else {
+		log.Printf("sub queued for next play: %s", url)
+	}
+	io.WriteString(w, "ok\n")
 }
 
 func handleSubscribe(w http.ResponseWriter, r *http.Request) {
@@ -344,25 +634,17 @@ func handleSubscribe(w http.ResponseWriter, r *http.Request) {
 func startHTTP() {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/description.xml", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/xml; charset=utf-8")
-		fmt.Fprint(w, deviceDescriptionXML())
-	})
+	xmlHandler := func(body func() string) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+			io.WriteString(w, body())
+		}
+	}
 
-	mux.HandleFunc("/scpd/avt", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/xml; charset=utf-8")
-		fmt.Fprint(w, avtSCPDXML())
-	})
-
-	mux.HandleFunc("/scpd/rc", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/xml; charset=utf-8")
-		fmt.Fprint(w, genericSCPDXML())
-	})
-
-	mux.HandleFunc("/scpd/cm", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/xml; charset=utf-8")
-		fmt.Fprint(w, genericSCPDXML())
-	})
+	mux.HandleFunc("/description.xml", xmlHandler(deviceDescriptionXML))
+	mux.HandleFunc("/scpd/avt", xmlHandler(avtSCPDXML))
+	mux.HandleFunc("/scpd/rc", xmlHandler(genericSCPDXML))
+	mux.HandleFunc("/scpd/cm", xmlHandler(genericSCPDXML))
 
 	mux.HandleFunc("/ctrl/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "POST" {
@@ -370,7 +652,7 @@ func startHTTP() {
 		} else if r.Method == "SUBSCRIBE" || r.Method == "UNSUBSCRIBE" {
 			handleSubscribe(w, r)
 		} else {
-			w.WriteHeader(405)
+			w.WriteHeader(http.StatusMethodNotAllowed)
 		}
 	})
 
@@ -378,8 +660,19 @@ func startHTTP() {
 		handleSubscribe(w, r)
 	})
 
+	mux.HandleFunc("/sub", handleSubAPI)
+
+	srv := &http.Server{
+		Addr:              ":" + httpPort,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
 	log.Printf("HTTP server on %s:%s", localIP, httpPort)
-	if err := http.ListenAndServe(":"+httpPort, mux); err != nil {
+	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal("HTTP:", err)
 	}
 }
@@ -436,7 +729,11 @@ func startSSDP() {
 
 	outConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP(localIP), Port: 0})
 	if err != nil {
-		outConn, _ = net.ListenUDP("udp4", nil)
+		log.Printf("SSDP out bind to %s failed (%v), falling back to any", localIP, err)
+		outConn, err = net.ListenUDP("udp4", nil)
+		if err != nil {
+			log.Fatal("SSDP out:", err)
+		}
 	}
 
 	listenAddr, _ := net.ResolveUDPAddr("udp4", "0.0.0.0:1900")
@@ -481,32 +778,9 @@ func startSSDP() {
 }
 
 func extractHeader(response, header string) string {
-	for _, line := range strings.Split(response, "\r\n") {
+	for line := range strings.SplitSeq(response, "\r\n") {
 		if strings.HasPrefix(strings.ToUpper(line), strings.ToUpper(header)+":") {
 			return strings.TrimSpace(line[len(header)+1:])
-		}
-	}
-	return ""
-}
-
-func getIfaceName() string {
-	ifaces, _ := net.Interfaces()
-	for _, iface := range ifaces {
-		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-		addrs, _ := iface.Addrs()
-		for _, addr := range addrs {
-			var ip net.IP
-			switch v := addr.(type) {
-			case *net.IPNet:
-				ip = v.IP
-			case *net.IPAddr:
-				ip = v.IP
-			}
-			if ip != nil && ip.String() == localIP {
-				return iface.Name
-			}
 		}
 	}
 	return ""
@@ -519,22 +793,28 @@ func byebye() {
 		return
 	}
 	defer conn.Close()
-	var buf bytes.Buffer
-	buf.WriteString("NOTIFY * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nNT: urn:schemas-upnp-org:device:MediaRenderer:1\r\nNTS: ssdp:byebye\r\nUSN: " + deviceUUID + "::urn:schemas-upnp-org:device:MediaRenderer:1\r\n\r\n")
-	conn.WriteToUDP(buf.Bytes(), mcastAddr)
+	msg := "NOTIFY * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nNT: urn:schemas-upnp-org:device:MediaRenderer:1\r\nNTS: ssdp:byebye\r\nUSN: " + deviceUUID + "::urn:schemas-upnp-org:device:MediaRenderer:1\r\n\r\n"
+	conn.WriteToUDP([]byte(msg), mcastAddr)
 }
 
 func joinMulticast(conn *net.UDPConn, mcastAddr *net.UDPAddr) {
+	ip4 := mcastAddr.IP.To4()
+	if ip4 == nil {
+		return
+	}
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return
 	}
+	fd, err := conn.File()
+	if err != nil {
+		return
+	}
+	defer fd.Close()
+	sockFd := int(fd.Fd())
+
 	for _, iface := range ifaces {
 		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagMulticast == 0 {
-			continue
-		}
-		ip4 := mcastAddr.IP.To4()
-		if ip4 == nil {
 			continue
 		}
 		mreq := &syscall.IPMreq{}
@@ -552,12 +832,7 @@ func joinMulticast(conn *net.UDPConn, mcastAddr *net.UDPAddr) {
 				continue
 			}
 			copy(mreq.Interface[:], ip)
-			fd, err := conn.File()
-			if err != nil {
-				continue
-			}
-			syscall.SetsockoptIPMreq(int(fd.Fd()), syscall.IPPROTO_IP, syscall.IP_ADD_MEMBERSHIP, mreq)
-			fd.Close()
+			syscall.SetsockoptIPMreq(sockFd, syscall.IPPROTO_IP, syscall.IP_ADD_MEMBERSHIP, mreq)
 		}
 	}
 }

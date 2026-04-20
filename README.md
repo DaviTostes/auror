@@ -2,7 +2,7 @@
 
 A zero-dependency DLNA renderer written in Go that plays media using mpv.
 
-Send media from any DLNA controller (like UnitvNet, BubbleUPnP, or any smart TV) directly to mpv on your machine.
+Send media from any DLNA controller (like BubbleUPnP, smart TV or any streaming apps) directly to mpv on your machine.
 
 ## Dependencies
 
