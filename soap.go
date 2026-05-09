@@ -135,7 +135,24 @@ func handleControl(w http.ResponseWriter, r *http.Request) {
 
 	case "Stop":
 		log.Println("Stop")
-		go stopPlayback()
+		if mpvRunning() {
+			if _, err := mpvCommand("stop"); err != nil {
+				log.Printf("mpv stop failed: %v — falling back to kill", err)
+				go stopPlayback()
+			} else {
+				mpvMu.Lock()
+				currentURL = ""
+				currentSub = ""
+				pendingStart = ""
+				playingURL = ""
+				nextURL = ""
+				nextSub = ""
+				mpvMu.Unlock()
+				setTransportState("STOPPED")
+			}
+		} else {
+			setTransportState("STOPPED")
+		}
 		io.WriteString(w, soapOK(soapAction))
 
 	case "Pause":
